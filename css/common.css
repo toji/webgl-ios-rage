@@ -1,0 +1,32 @@
+body {
+    font: 0.8em Verdana,sans-serif;
+    text-align: center;
+}
+
+#fps-counter {
+    position: absolute;
+    top: 5px;
+    left: 5px;
+    z-index: 2;
+    color: white;
+    border: 1px solid #6699FF;
+    background-color: #3355FF;
+    opacity: 0.5;
+    -moz-border-radius: 5px;
+    -webkit-border-radius: 5px;
+    padding: 5px;
+    min-width: 75px;
+    text-align: center;
+}
+
+#viewport-frame {
+    position: relative;
+    margin: auto;
+    width: 960px;
+    height: 640px;
+}
+
+canvas {
+    cursor: move;
+    background-color: black;
+}
