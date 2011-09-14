@@ -526,6 +526,7 @@ RageMap.prototype.loadTexture = function(gl, offset) {
     
     img.onload = function() {
         offset.loaded = true;
+        offset.img = null;
         
         // Check and make sure the texture is still needed
         if(!offset.texture) { return; }
