@@ -1,107 +1,43 @@
 <!DOCTYPE html>
 
+<!--
+Copyright (c) 2011 Brandon Jones
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+   1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+   2. Altered source versions must be plainly marked as such, and must not
+   be misrepresented as being the original software.
+
+   3. This notice may not be removed or altered from any source
+   distribution.
+-->
+
 <html>
-	<head>
-		<title>Rage Test</title>
-		
-		<!-- Stylesheet -->
-		<link type="text/css" href="css/common.css" rel="stylesheet" />
-		
-		<!-- Common Utilities -->
-		<script type="text/javascript" src="js/webgl-debug.js"></script>
-		<script type="text/javascript" src="js/glMatrix.js"></script>
-		<script type="text/javascript" src="js/glSandbox.js"></script>
-		
-		<script type="text/javascript" src="js/rage_map.js"></script>
-		
-		<script type="text/javascript" src="js/jquery-1.5.2.min.js"></script>
-		<script type="text/javascript" src="js/binFile.js"></script>
-		
-		
-		<!-- Main Javascript -->
-		<script type="text/javascript">
-			var gl;
-			var map;
-			var freelook = false;
-			
-			function initScene(gl) {
-			    gl.enable(gl.DEPTH_TEST);
-				gl.depthFunc(gl.LEQUAL);
-				
-				gl.enable(gl.CULL_FACE);
-				gl.frontFace(gl.CW);
-				
-				map = new RageMap(gl, 'HD_RageLevel1.iosMap', 'img/HD_RageLevel1');
-			}
-			
-			// Draw a single frame, return "false" if you wish to stop animating
-			function drawFrame(gl, event) {
-			    $('#fps').text(event.framesPerSecond);
-			    
-			    if(!map) { return; }
-			    
-				// Clear back buffer but not color buffer (we expect the entire scene to be overwritten)
-				gl.depthMask(true);
-				gl.clear(gl.DEPTH_BUFFER_BIT);
-				
-                map.draw(gl, event, freelook);
-                if(freelook) {
-                    map.drawPath(gl, event, freelook);
-                }
-                
-                map.updatePath(gl, event.frameTime);
-			}
-			
-			// Called once the page has been loaded
-			function main() {
-				var canvas = document.getElementById('viewport');
-				
-				// Set the canvas size
-				canvas.width = 960;
-				canvas.height = 640;
-				
-				// Remove the "true" here to stop running with a Debug WebGL context
-				gl = setupWebGLSandbox(canvas, true);
-				initScene(gl);
-				animateWebGLSandbox(gl, canvas, drawFrame);
-				
-				canvas.onmousemove = function(event) {
-                    var x = event.pageX - canvas.parentElement.offsetLeft;
-                    var y = event.pageY - canvas.parentElement.offsetTop;
-                    
-                    if(map) {
-                        map.setLook(
-                            ((x / canvas.width) - 0.5) * 2.0,
-                            ((y / canvas.height) - 0.5) * -2.0
-                        );
-                    }
-                }
-                
-                document.onkeypress = function(event) {
-                    if(event.which == 13 || event.which == 32) {
-                        map.pause(!map.paused);
-                    }
-                }
-			}
-			
-			$(function() {
-				main();
-			});
-		</script>
-	</head>
-	<body>
-		<div id="viewport-frame">
-			<canvas id="viewport">
-				Sorry, but your browser does not support WebGL or does not have it enabled.
-				To get a WebGL-enabled browser, please see:<br/>
-				<a href="http://www.khronos.org/webgl/wiki/Getting_a_WebGL_Implementation" target="_blank">
-					Getting a WebGL Implementation
-				</a>
-			</canvas>
-			<div id="fps-counter">
-				FPS: <span id="fps">0</span>
-			</div>
-		</div>
-		<p>Controls - Move mouse over viewport to look around, Space to pause/resume</p>
-	</body>
+    <head>
+        <title>iOS Rage</title>
+
+        <script src="js/util/require.js" data-main="js/index"></script>
+
+        <link href="css/index.css" rel="stylesheet" type="text/css" />
+    </head>
+    <body>
+        <div id="game-frame">
+            <canvas id="game-canvas"></canvas>
+            <div id="fps-counter">
+                FPS: <span id="fps">--</span>
+            </div>
+            <button id="fullscreen">Fullscreen</button>
+        </div>
+    </body>
 </html>
