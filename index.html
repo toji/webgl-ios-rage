@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 
 <!--
-Copyright (c) 2011 Brandon Jones
+Copyright (c) 2012 Brandon Jones
 
 This software is provided 'as-is', without any express or implied
 warranty. In no event will the authors be held liable for any damages
@@ -11,33 +11,145 @@ Permission is granted to anyone to use this software for any purpose,
 including commercial applications, and to alter it and redistribute it
 freely, subject to the following restrictions:
 
-   1. The origin of this software must not be misrepresented; you must not
-   claim that you wrote the original software. If you use this software
-   in a product, an acknowledgment in the product documentation would be
-   appreciated but is not required.
+    1. The origin of this software must not be misrepresented; you must not
+    claim that you wrote the original software. If you use this software
+    in a product, an acknowledgment in the product documentation would be
+    appreciated but is not required.
 
-   2. Altered source versions must be plainly marked as such, and must not
-   be misrepresented as being the original software.
+    2. Altered source versions must be plainly marked as such, and must not
+    be misrepresented as being the original software.
 
-   3. This notice may not be removed or altered from any source
-   distribution.
+    3. This notice may not be removed or altered from any source
+    distribution.
 -->
 
 <html>
     <head>
-        <title>iOS Rage</title>
+        <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
 
-        <script src="js/util/require.js" data-main="js/index"></script>
+        <title>RAGE - Mutant Bash TV (iOS)</title>
+        <link href="css/common.css" rel="stylesheet" type="text/css" />
 
-        <link href="css/index.css" rel="stylesheet" type="text/css" />
+        <script src="js/util/require.js"></script>
+        <script>
+            require.config({
+                baseUrl: "js"
+            });
+
+            require([
+                "rage-map",
+                "util/gl-util",
+                "util/gl-matrix-min",
+                "js/util/game-shim.js",
+                "js/util/Stats.js"
+            ], function(RageMap, GLUtil) {
+                "use strict";
+
+                var Renderer = function (gl, canvas) {
+                    this.projectionMat = mat4.create();
+                    
+                    gl.clearColor(0.0, 0.0, 0.1, 1.0);
+                    gl.clearDepth(1.0);
+
+                    gl.enable(gl.DEPTH_TEST);
+                    gl.depthFunc(gl.LEQUAL);
+
+                    gl.enable(gl.CULL_FACE);
+                    gl.frontFace(gl.CW);
+
+                    //gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+                    
+                    this.map = new RageMap();
+                    this.map.load(gl, "root/HD_RageLevel1.iosMap", "root/textures/HD_RageLevel1");
+
+                    var self = this;
+                    document.onkeypress = function(event) {
+                        if(event.which == 13 || event.which == 32) {
+                            self.map.pause(!self.map.paused);
+                        }
+                    }
+
+                    canvas.onclick = function(event) {
+                        if(document.pointerLockElement) {
+                            document.exitPointerLock();
+                        } else {
+                            canvas.requestPointerLock();
+                        }
+                        
+                    }
+
+                    var lookX = 0, lookY = 0;
+                    canvas.onmousemove = function(event) {
+                        if(document.pointerLockElement) {
+                            lookX += event.movementX * 0.005;
+                            lookY -= event.movementY * 0.005;
+                            lookY = Math.max(Math.min(lookY, Math.PI * 0.5), -Math.PI * 0.5);
+                            self.map.setLook(lookX, lookY);
+                        }
+                    }
+
+                    document.getElementById("none").addEventListener("change", function() {
+                        if(!this.checked) { return; }
+                        self.map.textured = false;
+                    }, false);
+
+                    document.getElementById("jpg").addEventListener("change", function() {
+                        if(!this.checked) { return; }
+                        self.map.textured = true;
+                        self.map.useCrunch = false;
+                        self.map.updateTextures(gl);
+                    }, false);
+
+                    document.getElementById("crunch").addEventListener("change", function() {
+                        if(!this.checked) { return; }
+                        self.map.textured = true;
+                        self.map.useCrunch = true;
+                        self.map.useCrunchWorker = false;
+                        self.map.updateTextures(gl);
+                    }, false);
+
+                    document.getElementById("crunchWorker").addEventListener("change", function() {
+                        if(!this.checked) { return; }
+                        self.map.textured = true;
+                        self.map.useCrunch = true;
+                        self.map.useCrunchWorker = true;
+                        self.map.updateTextures(gl);
+                    }, false);
+                };
+
+                Renderer.prototype.resize = function (gl, canvas) {
+                    gl.viewport(0, 0, canvas.width, canvas.height);
+                    mat4.perspective(45, canvas.width/canvas.height, 1.0, 4096.0, this.projectionMat);
+                };
+
+                Renderer.prototype.draw = function (gl, timing) {
+                    gl.clear(gl.DEPTH_BUFFER_BIT);
+
+                    this.map.draw(gl, timing, this.projectionMat);
+                    this.map.updatePath(gl, timing.frameTime);
+                };
+
+                // Setup the canvas and GL context, initialize the scene 
+                var canvas = document.getElementById("webgl-canvas");
+                var contextHelper = new GLUtil.ContextHelper(canvas);
+                var renderer = new Renderer(contextHelper.gl, canvas);
+
+                var stats = new Stats();
+                document.body.appendChild(stats.domElement);
+                
+                // Get the render loop going
+                contextHelper.start(renderer, stats);
+            });
+        </script>
     </head>
     <body>
-        <div id="game-frame">
-            <canvas id="game-canvas"></canvas>
-            <div id="fps-counter">
-                FPS: <span id="fps">--</span>
-            </div>
-            <button id="fullscreen">Fullscreen</button>
+        <h1>RAGE - Mutant Bash TV (iOS)</h1>
+        <canvas id="webgl-canvas"></canvas>
+        <div id="controls">
+            <input type="radio" name="textureType" id="none"/> <label for="jpg">None</label><br/>
+            <input type="radio" name="textureType" id="jpg" checked/> <label for="jpg">JPEG</label><br/>
+            <input type="radio" name="textureType" id="crunch"/> <label for="crunch">Crunch</label><br/>
+            <input type="radio" name="textureType" id="crunchWorker"/> <label for="crunchWorker">Crunch in Worker</label><br/>
         </div>
     </body>
 </html>

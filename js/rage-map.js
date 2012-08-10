@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011 Brandon Jones
+ * Copyright (c) 2012 Brandon Jones
  *
  * This software is provided 'as-is', without any express or implied
  * warranty. In no event will the authors be held liable for any damages
@@ -22,42 +22,146 @@
  */
 
 define([
-    "util/binary-file",
     "util/gl-util",
-    "js/util/gl-matrix.js"
-], function (binaryFile, glUtil) {
+    "crunch",
+    "util/gl-matrix-min"
+], function (GLUtil, crunch) {
+
+    var crunchWorker = new Worker("js/crunch-worker.js");
+
+    var pendingCrunchTextures = {};
+
+    crunchWorker.onmessage = function(msg) {
+        var pk = pendingCrunchTextures[msg.data.src];
+        var texture = pk.texture;
+        var gl = pk.gl;
+
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        console.time("Upload CRN");
+        gl.compressedTexImage2D(gl.TEXTURE_2D, 0, msg.data.internalFormat, msg.data.width, msg.data.height, 0, msg.data.dxtData);
+        console.timeEnd("Upload CRN");
+
+        delete pendingCrunchTextures[msg.data.src];
+    };
+
+    var loadCrunchTexture = function(gl, src, texture, useWorker) {
+        if(useWorker) {
+            pendingCrunchTextures[src] = {texture: texture, gl: gl};
+            crunchWorker.postMessage({src: src});
+        } else {
+            // Load from CRN
+            var xhr = new XMLHttpRequest();
+            xhr.onload = function () {
+                crunch.uploadCRNLevels(gl, this.s3tc, xhr.response, texture, false);
+            };
+            xhr.responseType = "arraybuffer";
+            xhr.open('GET', src, true);
+            xhr.send(null);
+        }
+    };
+
+    var loadTexture = (function createTextureLoader() {
+        var MAX_CACHE_IMAGES = 16;
+
+        var textureImageCache = new Array(MAX_CACHE_IMAGES);
+        var cacheTop = 0;
+        var remainingCacheImages = MAX_CACHE_IMAGES;
+        var pendingTextureRequests = [];
+
+        var TextureImageLoader = function(loadedCallback) {
+            var self = this;
+
+            this.gl = null;
+            this.texture = null;
+            this.callback = null;
+
+            this.image = new Image();
+            this.image.addEventListener("load", function() {
+                var gl = self.gl;
+                gl.bindTexture(gl.TEXTURE_2D, self.texture);
+                console.time("Upload JPEG");
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, self.image);
+                console.timeEnd("Upload JPEG");
+                //gl.generateMipmap(gl.TEXTURE_2D);
+
+                loadedCallback(self);
+                if(self.callback) { self.callback(self.texture); }
+            });
+        };
+
+        TextureImageLoader.prototype.loadTexture = function(gl, src, texture, callback) {
+            this.gl = gl;
+            this.texture = texture;
+            this.callback = callback;
+            this.image.src = src;
+        };
+
+        var PendingTextureRequest = function(gl, src, texture, callback) {
+            this.gl = gl;
+            this.src = src;
+            this.texture = texture;
+            this.callback = callback;
+        };
+
+        function releaseTextureImageLoader(til) {
+            var req;
+            if(pendingTextureRequests.length) {
+                req = pendingTextureRequests.shift();
+                til.loadTexture(req.gl, req.src, req.texture, req.callback);
+            } else {
+                textureImageCache[cacheTop++] = til;
+            }
+        }
+
+        return function(gl, src, texture, callback) {
+            var til;
+
+            if(cacheTop) {
+                til = textureImageCache[--cacheTop];
+                til.loadTexture(gl, src, texture, callback);
+            } else if (remainingCacheImages) {
+                til = new TextureImageLoader(releaseTextureImageLoader);
+                til.loadTexture(gl, src, texture, callback);
+                --remainingCacheImages;
+            } else {
+                pendingTextureRequests.push(new PendingTextureRequest(gl, src, texture, callback));
+            }
+        };
+    })();
     
-    var BinaryFile = binaryFile.BinaryFile;
-
     // Shader for rendering world geometry
-    var meshVS = "attribute vec3 position;\n";
-    meshVS += "attribute vec2 texture;\n";
-    meshVS += "uniform mat4 modelViewMat;\n";
-    meshVS += "uniform mat4 projectionMat;\n";
-    meshVS += "varying vec2 texCoord;\n";
-    meshVS += "void main(void) {\n";
-    meshVS += "    vec4 vPosition = modelViewMat * vec4(position, 1.0);\n";
-    meshVS += "    texCoord = vec2((texture.s / 65535.0) + 0.5, (-texture.t / 65535.0) + 0.5);\n";
-    meshVS += "    gl_Position = projectionMat * vPosition;\n";
-    meshVS += "}";
+    var meshVS = [
+        "attribute vec3 position;",
+        "attribute vec2 texture;",
+        "uniform mat4 modelViewMat;",
+        "uniform mat4 projectionMat;",
+        "varying vec2 texCoord;",
+        "void main(void) {",
+        "    vec4 vPosition = modelViewMat * vec4(position, 1.0);",
+        "    texCoord = vec2((texture.s / 65535.0) + 0.5, (-texture.t / 65535.0) + 0.5);",
+        "    gl_Position = projectionMat * vPosition;",
+        "}"
+    ].join("\n");
 
-    var meshFS = "uniform sampler2D diffuse;\n";
-    meshFS += "varying vec2 texCoord;\n";
-    meshFS += "void main(void) {\n";
-    meshFS += "    gl_FragColor = texture2D(diffuse, texCoord.st);\n";
-    meshFS += "}";
+    var meshFS = [
+        "precision highp float;",
 
-    // Shader for rendering the path 
-    var pathVS = "attribute vec3 position;\n";
-    pathVS += "uniform mat4 modelViewMat;\n";
-    pathVS += "uniform mat4 projectionMat;\n";
-    pathVS += "void main(void) {\n";
-    pathVS += "    vec4 vPosition = modelViewMat * vec4(position, 1.0);\n";
-    pathVS += "    gl_Position = projectionMat * vPosition;\n";
-    pathVS += "}";
+        "uniform sampler2D diffuse;",
+        "varying vec2 texCoord;",
+        "void main(void) {",
+        "    gl_FragColor = texture2D(diffuse, texCoord.st);",
+        "}"
+    ].join("\n");
 
-    var pathFS_White = "void main(void) { gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0); }";
-    var pathFS_Green = "void main(void) { gl_FragColor = vec4(0.0, 0.75, 0.0, 1.0); }";
+    var meshFS2 = [
+        "precision highp float;",
+
+        "uniform sampler2D diffuse;",
+        "varying vec2 texCoord;",
+        "void main(void) {",
+        "   gl_FragColor = vec4(texCoord.s, 0, texCoord.t, 1.0);",
+        "}"
+    ].join("\n");
 
     var ms_per_pt = 200; // How long does it take to travel between each point of the path
 
@@ -73,311 +177,207 @@ define([
         this.paused = true;
 
         this.textures = [];
+        
+        this.poolTextures = true;
+        this.throttleTextures = true;
+
+        this.textured = true;
+        this.useCrunch = false;
+        this.useCrunchWorker = false;
     }
     
     RageMap.prototype.load = function (gl, url, texurl) {
         var that = this;
         this.texurl = texurl;
+        this.s3tc = GLUtil.getExtension(gl, "WEBGL_compressed_texture_s3tc");
 
-        // Must request this way (can't use jQuery), since the char encoding matters!
-        var request = new XMLHttpRequest();
-        request.onreadystatechange = function () {
-            if (request.readyState == 4 && request.status == 200) {
-                var parsed = that.parse(request.responseText);
-                that.compile(gl, parsed);
+        var xhr = new XMLHttpRequest();
+        xhr.responseType = "arraybuffer";
+        xhr.onload = function () {
+            if(xhr.status == 200) {
+                var parsedData = that.parse(xhr.response);
+                that.compile(gl, parsedData);
 
                 that.complete = true;
             }
         };
-        request.open('GET', url, true);
-        request.overrideMimeType('text/plain; charset=x-user-defined');
-        request.setRequestHeader('Content-Type', 'text/plain');
-        request.send(null);
+        xhr.open('GET', url, true);
+        xhr.send(null);
     };
 
     //
     // File Parsing
     //
 
-    RageMap.prototype.parse = function(data) {
-        var src = new BinaryFile(data);
+    RageMap.prototype.parse = function(src) {
+        var dataView = new DataView(src);
     
-        this.header = this.parseHeader(src);
-    
-        this.path = this.parsePath(src, this.header.lumps[4]);
-    
-        this.position = [this.path[0].x, this.path[0].y, this.path[0].z];
+        this.header = this.parseHeader(dataView);
+        this.path = this.parsePath(dataView, this.header.lumps[4]);
     
         var parsed = {
-            verts: this.parseVerts(src, this.header.lumps[0]),
-            indices: this.parseIndices(src, this.header.lumps[1]),
-            pathVerts: this.parsePathVerts(this.path),
+            verts: this.parseVerts(dataView, this.header.lumps[0]),
+            indices: this.parseIndices(src, this.header.lumps[1])
         };
     
-        this.offsets = this.parseTextures(src, this.header.lumps[2]);
-        this.meshes = this.parseMeshes(src, this.header.lumps[3]);
+        this.offsets = this.parseTextures(dataView, this.header.lumps[2]);
+        this.meshes = this.parseMeshes(dataView, this.header.lumps[3]);
     
         return parsed;
-    }
+    };
 
-    RageMap.prototype.parseHeader = function(src) {
+    RageMap.prototype.parseHeader = function(dataView) {
         var header = {};
-    
-        src.seek(0);
-                
-        header.magic = src.readString(4);
-        header.name = src.readString(128);
-    
-        header.textureSize = src.readLong(); // Always 1024
-        src.readLong(); // Always 2
-        src.readLong(); // Always 2
+
+        header.textureSize = dataView.getInt32(132, true);
     
         header.lumps = [
-            {stride: 10}, 
-            {stride: 2}, 
-            {stride: 32}, 
-            {stride: 20},
-            {stride: 84}
+            {
+                stride: 10,
+                offset: dataView.getInt32(144, true),
+                elements: dataView.getInt32(164, true)
+            },
+            {
+                stride: 2,
+                offset: dataView.getInt32(148, true),
+                elements: dataView.getInt32(168, true)
+            },
+            {
+                stride: 32,
+                offset: dataView.getInt32(152, true),
+                elements: dataView.getInt32(172, true)
+            },
+            {
+                stride: 20,
+                offset: dataView.getInt32(156, true),
+                elements: dataView.getInt32(180, true)
+            },
+            {
+                stride: 84,
+                offset: dataView.getInt32(160, true),
+                elements: dataView.getInt32(184, true)
+            }
         ];
     
-        header.lumps[0].offset = src.readLong();
-        header.lumps[1].offset = src.readLong();
-        header.lumps[2].offset = src.readLong();
-        header.lumps[3].offset = src.readLong();
-        header.lumps[4].offset = src.readLong();
-    
-        header.lumps[0].elements = src.readLong();
-        header.lumps[1].elements = src.readLong();
-        header.lumps[2].elements = src.readLong();
-        src.readULong(); // Always 0
-        header.lumps[3].elements = src.readLong();
-        header.lumps[4].elements = src.readLong();
-    
-        header.max_textures = src.readLong();
+        header.max_textures = dataView.getInt32(188, true);
     
         return header;
-    }
+    };
 
-    RageMap.prototype.parseVerts = function(src, lump) {
+    RageMap.prototype.parseVerts = function(dataView, lump) {
         // Vertex Array
         var vertArray = new Float32Array(lump.elements * 5);
-    
-        src.seek(lump.offset);
-        for(var i = 0, o = 0; i < lump.elements; ++i) {
+
+        var end = lump.offset + (lump.elements * lump.stride);
+        for(var i = lump.offset, o = 0; i < end; i += lump.stride) {
             // Pos
-            vertArray[o++] = src.readShort(); // x
-            vertArray[o++] = src.readShort(); // y
-            vertArray[o++] = src.readShort(); // z
+            vertArray[o++] = dataView.getInt16(i, true); // x
+            vertArray[o++] = dataView.getInt16(i + 2, true); // y
+            vertArray[o++] = dataView.getInt16(i + 4, true); // z
         
             // Texcoord?
-            vertArray[o++] = src.readShort(); // s;
-            vertArray[o++] = src.readShort(); // t;
+            vertArray[o++] = dataView.getInt16(i + 6, true); // s;
+            vertArray[o++] = dataView.getInt16(i + 8, true); // t;
         }
 
         return vertArray;
-    }
+    };
 
     RageMap.prototype.parseIndices = function(src, lump) {
         // Index Array
-        var indexArray = new Uint16Array(lump.elements);
-    
-        src.seek(lump.offset);
-        for(var i = 0; i < lump.elements; ++i) {
-            indexArray[i] = src.readUShort();
-        }
+        return new Uint8Array(src, lump.offset, lump.elements * 2);
+    };
 
-        return indexArray;
-    }
-
-    RageMap.prototype.parseTextures = function(src, lump) {
+    RageMap.prototype.parseTextures = function(dataView, lump) {
         // Texture Array
         var textures = [];
-    
-        src.seek(lump.offset);
-        for(var i = 0; i < lump.elements; ++i) {
+        var i, j;
+        var end = lump.offset + (lump.elements * lump.stride);
+        for(i = lump.offset, j = 0; i < end; i += lump.stride, ++j) {
             textures.push({
-                imgId: i,
+                imgId: j,
                 img: null,
                 loaded: null,
                 texture: null,
-                vertOffset: src.readULong(),
-                vertCount:  src.readULong(),
-                indexOffset: src.readULong(),
-                indexCount: src.readULong(),
+                vertOffset: dataView.getUint32(i, true),
+                vertCount:  dataView.getUint32(i + 4, true),
+                indexOffset: dataView.getUint32(i + 8, true),
+                indexCount: dataView.getUint32(i + 12, true)
             });
-        
-            src.readString(16); // This is always 0, for some reason
         }
 
         return textures;
-    }
+    };
 
-    RageMap.prototype.parseMeshes = function(src, lump) {
+    RageMap.prototype.parseMeshes = function(dataView, lump) {
         // Mesh Array
         var meshes = [];
     
-        src.seek(lump.offset);
-        for(var i = 0; i < lump.elements; ++i) {
+        var end = lump.offset + (lump.elements * lump.stride);
+        for(var i = lump.offset; i < end; i += lump.stride) {
             meshes.push({
-                offset: src.readLong(),
-            
-                startIndex: src.readLong(),
-                indexCount: src.readLong(),
-            
-                x: src.readShort(),
-                y: src.readShort(),
-                z: src.readShort(),
-                radius: src.readShort(),
+                offset: dataView.getInt32(i, true),
+                startIndex: dataView.getInt32(i + 4, true),
+                indexCount: dataView.getInt32(i + 8, true)
             });
         }
 
         return meshes;
-    }
+    };
 
-    RageMap.prototype.parsePath = function(src, lump) {
+    RageMap.prototype.parsePath = function(dataView, lump) {
         // Path Array
         var path = [];
+        var i, j;
     
-        src.seek(lump.offset);
-        for(var i = 0; i < lump.elements; ++i) {
+        var end = lump.offset + (lump.elements * lump.stride);
+        for(i = lump.offset; i < end; i += lump.stride) {
+
+            var pos = vec3.create();
+                pos[0] = -dataView.getFloat32(i, true);
+                pos[1] = dataView.getFloat32(i+8, true);
+                pos[2] = -dataView.getFloat32(i+4, true);
+
+            var orient = quat4.create();
+                orient[0] = -dataView.getFloat32(i+12, true);
+                orient[1] = dataView.getFloat32(i+20, true);
+                orient[2] = -dataView.getFloat32(i+16, true);
+                orient[3] = dataView.getFloat32(i+24, true);
+
             var point = {
-                x: src.readFloat(),
-                z: src.readFloat(),
-                y: -src.readFloat(),
-                lx: src.readFloat(),
-                lz: src.readFloat(),
-                ly: -src.readFloat(),
-                lw: src.readFloat(),
-            
-                offset: src.readLong(),
-                elements: src.readLong(),
+                pos: pos,
+                orient: orient,
+                offset: dataView.getInt32(i + 28, true),
+                elements: dataView.getInt32(i + 32, true),
             
                 atlas: [],
-                list: [],
+                list: []
             };
         
-            // Read unused values
-            src.readLong(); // 0
-            src.readLong(); // 0
-            
-            src.readFloat();
-            src.readFloat();
-        
-            for(var j = 0; j < 16; ++j) {
-                var idx = src.readShort();
+            for(j = 0; j < 16; ++j) {
+                var idx = dataView.getInt16(i + 52 + (j * 2), true);
                 point.atlas[j] = idx;
             }
         
             path.push(point);
         }
-    
-        for(var i in path) {
+        
+        // TODO: Change to Int16Array blit?
+        for(i in path) {
             var element = path[i];
         
-            src.seek(element.offset);
-            for(var j = 0; j < element.elements; ++j) {
-                element.list.push(src.readUShort());
+            end = element.offset + (element.elements * 2);
+            for(j = element.offset; j < end; j += 2) {
+                element.list.push(dataView.getUint16(j, true));
             }
         }
     
         return path;
-    }
-
-    RageMap.prototype.parsePathVerts = function(path) {
-        // Vertex Array
-        var vertArray = new Float32Array(path.length * 9);
-    
-        var o = 0;
-        for(var i = 0; i < path.length; ++i) {
-            var pt = path[i];
-    
-            // Pos
-            vertArray[o++] = pt.x;
-            vertArray[o++] = pt.y;
-            vertArray[o++] = pt.z;
-        }
-    
-        for(var i = 0; i < path.length; ++i) {
-            var pt = path[i];
-    
-            // Look Start
-            vertArray[o++] = pt.x;
-            vertArray[o++] = pt.y;
-            vertArray[o++] = pt.z;
-        
-            var look = quat4.multiplyVec3([pt.lx, pt.ly, pt.lz, pt.lw], [0, -7, 0]);
-        
-            // Look Direction
-            vertArray[o++] = pt.x + look[0];
-            vertArray[o++] = pt.y + look[1];
-            vertArray[o++] = pt.z + look[2];
-        }
-
-        return vertArray;
-    }
+    };
 
     //
     // WebGL resource management
     //
-
-    RageMap.prototype.compileShader = function(gl, source, type) {
-        var shaderHeader = "#ifdef GL_ES\n";
-    	shaderHeader += "precision highp float;\n";
-    	shaderHeader += "#endif\n";
- 
-        var shader = gl.createShader(type);
- 
-        gl.shaderSource(shader, shaderHeader + source);
-        gl.compileShader(shader);
- 
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-            console.debug(gl.getShaderInfoLog(shader));
-            gl.deleteShader(shader);
-            return null;
-        }
- 
-        return shader;
-    }
-
-    RageMap.prototype.createShaderProgram = function(gl, vertexShader, fragmentShader, attribs, uniforms) {
-        var shaderProgram = gl.createProgram();
-    
-        var vs = this.compileShader(gl, vertexShader, gl.VERTEX_SHADER);
-        var fs = this.compileShader(gl, fragmentShader, gl.FRAGMENT_SHADER);
-
-        gl.attachShader(shaderProgram, vs);
-        gl.attachShader(shaderProgram, fs);
-        gl.linkProgram(shaderProgram);
-
-        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
-            gl.deleteProgram(shaderProgram);
-            gl.deleteShader(vertexShader);
-            gl.deleteShader(fragmentShader);
-            return null;
-        }
-    
-        this.bindShaderVars(gl, shaderProgram, attribs, uniforms);
-    
-        return shaderProgram;
-    }
-
-    RageMap.prototype.bindShaderVars = function(gl, shaderProgram, attribs, uniforms) {
-        if(attribs) {
-            shaderProgram.attribute = {};
-            for(var i in attribs) {
-                var attrib = attribs[i];
-                shaderProgram.attribute[attrib] = gl.getAttribLocation(shaderProgram, attrib);
-            }
-        }
-    
-        if(uniforms) {
-            shaderProgram.uniform = {};
-            for(var i in uniforms) {
-                var uniform = uniforms[i];
-                shaderProgram.uniform[uniform] = gl.getUniformLocation(shaderProgram, uniform);
-            }
-        }
-    }
 
     RageMap.prototype.compile = function(gl, parsed) {
         for(var i = 0; i < this.header.max_textures * 2; ++i) {
@@ -404,15 +404,10 @@ define([
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, parsed.indices, gl.STATIC_DRAW);
     
-        this.pathBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.pathBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, parsed.pathVerts, gl.STATIC_DRAW);
-    
         // Compile the shaders
-        this.meshShader = glUtil.createShaderProgram(gl, meshVS, meshFS);
-        this.pathWhiteShader = glUtil.createShaderProgram(gl, pathVS, pathFS_White);
-        this.pathGreenShader = glUtil.createShaderProgram(gl, pathVS, pathFS_Green);
-    }
+        this.meshShader = GLUtil.createProgram(gl, meshVS, meshFS);
+        this.meshShader2 = GLUtil.createProgram(gl, meshVS, meshFS2);
+    };
 
     //
     // Map Navigation
@@ -420,17 +415,20 @@ define([
 
     RageMap.prototype.setLook = function(x, y) {
         this.look_x = x;
-        this.look_y = y; 
-    }
+        this.look_y = y;
+    };
 
     RageMap.prototype.resetPath = function() {
         this.time = 0;
-    }
+    };
 
     RageMap.prototype.pause = function(paused) {
         this.paused = paused;
-    }
+    };
 
+    var pos = vec3.create();
+    var orient = quat4.create();
+    var orientMat = mat4.create();
     RageMap.prototype.updatePath = function(gl, frameTime) {
         if(!this.complete) { return; }
     
@@ -460,51 +458,49 @@ define([
         var f = t0 - Math.floor(t0);
     
         // Interpolate between path points
-        var pos = vec3.lerp([-p0.x, -p0.y, -p0.z], 
-                            [-p1.x, -p1.y, -p1.z], f);
-                        
-        var orient = quat4.slerp([p0.lx, p0.ly, p0.lz, p0.lw],
-                                 [p1.lx, p1.ly, p1.lz, p1.lw], f);
-                             
+        vec3.lerp(p0.pos, p1.pos, f, pos);
+        quat4.slerp(p0.orient, p1.orient, f, orient);
+
         mat4.identity(this.viewMat);
-        mat4.rotateZ(this.viewMat, 3.1415);
-        mat4.rotateX(this.viewMat, 1.5707);
+        mat4.rotateY(this.viewMat, 3.14159);
+        mat4.rotateX(this.viewMat, -1.5707);
     
         if(this.look_x || this.look_y) {
             mat4.rotateX(this.viewMat, 1.047 * this.look_y);
             mat4.rotateZ(this.viewMat, 1.570 * this.look_x);
         }
-    
-        mat4.multiply(this.viewMat, quat4.toMat4(orient));
-    
+        
+        quat4.toMat4(orient, orientMat);
+        mat4.multiply(this.viewMat, orientMat);
         mat4.translate(this.viewMat, pos);
-    }
+    };
 
     RageMap.prototype.updateTextures = function(gl, path) {
-        var that = this;
+        if(!path) { path = this.curPath; }
+        var i, offset;
     
         if(path) {
             // Ensure all textures for the current position are loaded
-            for(var i in path.list) {
+            for(i in path.list) {
                 var meshId = Math.abs(path.list[i]);
-                var mesh = this.meshes[meshId]; 
-                var offset = this.offsets[mesh.offset];
+                var mesh = this.meshes[meshId];
+                offset = this.offsets[mesh.offset];
                 this.loadTexture(gl, offset);
-            
             }
         
-            for(var i = 0; i < 16; ++i) {
+            for(i = 0; i < 16; ++i) {
                 var imgId = path.atlas[i];
                 if(imgId < 0) { continue; }
             
-                var offset = this.offsets[imgId];
+                offset = this.offsets[imgId];
                 this.loadTexture(gl, offset);
             }
         }
-    }
+    };
 
     RageMap.prototype.loadTexture = function(gl, offset) {
-        if(offset.texture) { 
+        if(!this.textured) { return; }
+        if(offset.texture) {
             // If this texture is already loaded, push it to the back of the buffer
             // This serves as a simple "Most-recently-used" paging scheme
             var idx = this.textures.indexOf(offset.texture); // I have a feeling this is expensive...
@@ -512,127 +508,80 @@ define([
             this.textures.push(offset.texture);
             return;
         }
-    
-        var img = new Image();
-        var that = this;
-    
+        
         // Pull the first texture in the array (least recently used)
         // and use it, pushing it to the back
         var nextTexture = this.textures[0];
+        
         offset.texture = nextTexture;
-        if(nextTexture.offset != null) {
+        if(nextTexture.offset !== null) {
             nextTexture.offset.texture = null;
         }
         nextTexture.offset = offset;
         this.textures.splice(0, 1);
         this.textures.push(nextTexture);
-    
-        offset.img = img;
-    
-        img.onload = function() {
-            offset.loaded = true;
-            offset.img = null;
-        
-            // Check and make sure the texture is still needed
-            if(!offset.texture) { return; }
-            gl.bindTexture(gl.TEXTURE_2D, nextTexture.texture);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
-        };
-        img.src = this.texurl + '/' + offset.imgId + '.jpg';
-    }
+
+        var src = this.texurl + '/' + offset.imgId;
+
+        if(this.useCrunch) {
+            loadCrunchTexture(gl, src + '.crn', nextTexture.texture, this.useCrunchWorker);
+        } else {
+            loadTexture(gl, src + '.jpg', nextTexture.texture);
+        }
+    };
 
     //
     // Rendering functions
     //
 
     RageMap.prototype.bindTexture = function(gl, shader, texture) {
-        if(texture.texture) {        
+        if(this.textured && texture.texture) {
             gl.bindTexture(gl.TEXTURE_2D, texture.texture.texture);
         } else {
             gl.bindTexture(gl.TEXTURE_2D, null);
         }
         gl.uniform1i(shader.uniform.diffuse, 0);
     
-        // Setup the vertex buffer layout 
+        // Setup the vertex buffer layout
         gl.vertexAttribPointer(shader.attribute.position, 3, gl.FLOAT, false, 20, (texture.vertOffset * 20));
         gl.vertexAttribPointer(shader.attribute.texture, 2, gl.FLOAT, false, 20, 12 + (texture.vertOffset * 20));
-    }
+    };
 
     RageMap.prototype.draw = function(gl, event, projectionMat) {
         if(!this.complete) { return; }
-    
-        gl.activeTexture(gl.TEXTURE0);
-        gl.useProgram(this.meshShader);
-    		
+            
+        var shader = this.textured ? this.meshShader : this.meshShader2;
+        gl.useProgram(shader.program);
+            
         // Bind the matricies
-        gl.uniformMatrix4fv(this.meshShader.uniform.modelViewMat, false, this.viewMat);
-        gl.uniformMatrix4fv(this.meshShader.uniform.projectionMat, false, projectionMat);
+        gl.uniformMatrix4fv(shader.uniform.modelViewMat, false, this.viewMat);
+        gl.uniformMatrix4fv(shader.uniform.projectionMat, false, projectionMat);
     
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
     
-        gl.enableVertexAttribArray(this.meshShader.attribute.position);
-        gl.enableVertexAttribArray(this.meshShader.attribute.texture);
+        gl.enableVertexAttribArray(shader.attribute.position);
+        gl.enableVertexAttribArray(shader.attribute.texture);
+
+        gl.activeTexture(gl.TEXTURE0);
     
         var activeTexture = -1;
     
         for(var j in this.curPath.list) {
             var meshId = Math.abs(this.curPath.list[j]);
-            var mesh = this.meshes[meshId]; 
+            var mesh = this.meshes[meshId];
             var offset = this.offsets[mesh.offset];
         
             // Meshes are sorted by texture, only re-bind when the texture changes
             if(mesh.offset != activeTexture) {
                 activeTexture = mesh.offset;
-                this.bindTexture(gl, this.meshShader, offset);
+                this.bindTexture(gl, shader, offset);
             }
         
             var indexOffset = offset.indexOffset + mesh.startIndex;
             gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, indexOffset * 2);
         }
-    }
-
-    RageMap.prototype.drawPath = function(gl, event, projectionMat) {
-        if(!this.complete) { return; }
-    
-        //-----------------------------------------------
-        // Render the path points as a white dashed trail
-        gl.useProgram(this.pathWhiteShader);
-				
-        // Bind the matricies
-        gl.uniformMatrix4fv(this.pathWhiteShader.uniform.modelViewMat, false, this.viewMat);
-        gl.uniformMatrix4fv(this.pathWhiteShader.uniform.projectionMat, false, projectionMat);
-    
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.pathBuffer);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-    
-        gl.enableVertexAttribArray(this.pathWhiteShader.attribute.position);
-
-        // Setup the vertex buffer layout 
-        gl.vertexAttribPointer(this.pathWhiteShader.attribute.position, 3, gl.FLOAT, false, 12, 0);
-    
-        // Draw Path
-        gl.drawArrays(gl.LINES, 0, this.path.length);
-    
-        //-----------------------------------------------
-        // Render the path orientations as a green vector
-        gl.useProgram(this.pathGreenShader);
-				
-        // Bind the matricies
-        gl.uniformMatrix4fv(this.pathGreenShader.uniform.modelViewMat, false, this.viewMat);
-        gl.uniformMatrix4fv(this.pathGreenShader.uniform.projectionMat, false, projectionMat);
-    
-        gl.enableVertexAttribArray(this.pathGreenShader.attribute.position);
-
-        // Setup the vertex buffer layout 
-        gl.vertexAttribPointer(this.pathGreenShader.attribute.position, 3, gl.FLOAT, false, 12, 0);
-    
-        // Draw Look vectors
-        gl.drawArrays(gl.LINES, this.path.length, this.path.length * 2);
-    }
-    
-    return {
-        RageMap: RageMap
     };
-
+    
+    return RageMap;
 });

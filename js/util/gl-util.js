@@ -21,93 +21,172 @@
  *    distribution.
  */
 
-define(function() {
+define([
+    "js/util/game-shim.js"
+], function() {
 
     "use strict";
 
-    // Polyfill to ensure we can always call requestAnimaionFrame
-    if(!window.requestAnimationFrame) {
-        window.requestAnimationFrame = (function(){
-            return  window.webkitRequestAnimationFrame || 
-                    window.mozRequestAnimationFrame    || 
-                    window.oRequestAnimationFrame      || 
-                    window.msRequestAnimationFrame     || 
-                    function(callback, element){
-                      window.setTimeout(function() {
-                          callback(new Date().getTime());
-                      }, 1000 / 60);
-                    };
-        })();
+    var vendorPrefixes = ["", "WEBKIT_", "MOZ_"];
+
+    function getContext(canvas, options) {
+        var context;
+    
+        if (canvas.getContext) {
+            try {
+                context = canvas.getContext('webgl', options);
+                if(context) { return context; }
+            } catch(ex) {}
+        
+            try {
+                context = canvas.getContext('experimental-webgl', options);
+                if(context) { return context; }
+            } catch(ex) {}
+        }
+    
+        return null;
     }
 
+    function showGLFailed(element) {
+        var errorElement = document.createElement("div");
+        var errorHTML = "<h3>Sorry, but a WebGL context could not be created</h3>";
+        errorHTML += "Either your browser does not support WebGL, or it may be disabled.<br/>";
+        errorHTML += "Please visit <a href=\"http://get.webgl.org\">http://get.webgl.org</a> for ";
+        errorHTML += "details on how to get a WebGL enabled browser.";
+        errorElement.innerHTML = errorHTML;
+        errorElement.id = "gl-error";
+        element.parentNode.replaceChild(errorElement, element);
+    }
+
+    var ContextHelper = function(canvas) {
+        var self = this, resizeTimeout;
+
+        //
+        // Create gl context and start the render loop
+        //
+        this.canvas = canvas;
+        this.lastWidth = 0;
+        this.renderer = null;
+
+        this.gl = getContext(canvas, {alpha: false});
+
+        if(!this.gl) {
+            showGLFailed(canvas);
+        } else {
+            var resizeCallback = function() { self.windowResized(); };
+
+            // On mobile devices, the canvas size can change when we rotate. Watch for that:
+            document.addEventListener("orientationchange", resizeCallback, false);
+            window.addEventListener("resize", resizeCallback, false);
+        }
+    };
+
+    ContextHelper.prototype.start = function(renderer, stats) {
+        if(!renderer.draw) {
+            throw new Error("Object passed to startRenderLoop must have a draw function");
+        }
+
+        this.renderer = renderer;
+
+        var startTime = Date.now(),
+            lastTimeStamp = startTime,
+            canvas = this.canvas,
+            gl = this.gl;
+
+        var timingData = {
+            startTime: startTime,
+            timeStamp: 0,
+            elapsed: 0,
+            frameTime: 0
+        };
+
+        this.windowResized(true);
+    
+        function nextFrame(){
+            var time = Date.now();
+            // Recommendation from Opera devs: calling the RAF shim at the beginning of your
+            // render loop improves framerate on browsers that fall back to setTimeout
+            window.requestAnimationFrame(nextFrame, canvas);
+
+            timingData.timeStamp = time;
+            timingData.elapsed = time - startTime;
+            timingData.frameTime = time - lastTimeStamp;
+
+            if(stats) { stats.begin(); }
+            renderer.draw(gl, timingData);
+            if(stats) { stats.end(); }
+
+            lastTimeStamp = time;
+        }
+
+        window.requestAnimationFrame(nextFrame, canvas);
+    };
+
+    ContextHelper.prototype.windowResized = function(force) {
+        if(this.lastWidth === window.innerWidth && !force) { return; }
+
+        var canvas = this.canvas;
+
+        this.lastWidth = window.innerWidth;
+
+        canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+        canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+
+        if(this.renderer && this.renderer.resize) {
+            this.renderer.resize(this.gl, canvas);
+        }
+    };
+
+    var ShaderWrapper = function(gl, program) {
+        var i, attrib, uniform, count, name;
+
+        this.program = program;
+        this.attribute = {};
+        this.uniform = {};
+
+        count = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+        for (i = 0; i < count; i++) {
+            attrib = gl.getActiveAttrib(program, i);
+            this.attribute[attrib.name] = gl.getAttribLocation(program, attrib.name);
+        }
+
+        count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+        for (i = 0; i < count; i++) {
+            uniform = gl.getActiveUniform(program, i);
+            name = uniform.name.replace("[0]", "");
+            this.uniform[name] = gl.getUniformLocation(program, name);
+        }
+    };
+
     return {
-        getContext: function(canvas) {
-            var context;
-        
-            if (canvas.getContext) {
-                try {
-                    context = canvas.getContext('webgl');
-                    if(context) { return context; }
-                } catch(ex) {}
-            
-                try {
-                    context = canvas.getContext('experimental-webgl');
-                    if(context) { return context; }
-                } catch(ex) {}
-            }
-        
-            return null;
-        },
+        ContextHelper: ContextHelper,
+        ShaderWrapper: ShaderWrapper,
+
+        getContext: getContext,
+        showGLFailed: showGLFailed,
     
-        showGLFailed: function(element) {
-            var errorElement = document.createElement("div");
-            var errorHTML = "<h3>Sorry, but a WebGL context could not be created</h3>";
-            errorHTML += "Either your browser does not support WebGL, or it may be disabled.<br/>";
-            errorHTML += "Please visit <a href=\"http://get.webgl.org\">http://get.webgl.org</a> for ";
-            errorHTML += "details on how to get a WebGL enabled browser.";
-            errorElement.innerHTML = errorHTML;
-            errorElement.id = "gl-error";
-            element.parentNode.replaceChild(errorElement, element);
-        },
-    
-        createShaderProgram: function(gl, vertexShader, fragmentShader) {
+        createProgram: function(gl, vertexShaderSource, fragmentShaderSource) {
             var shaderProgram = gl.createProgram(),
-                vs = this._compileShader(gl, vertexShader, gl.VERTEX_SHADER),
-                fs = this._compileShader(gl, fragmentShader, gl.FRAGMENT_SHADER);
+                vs = this.compileShader(gl, vertexShaderSource, gl.VERTEX_SHADER),
+                fs = this.compileShader(gl, fragmentShaderSource, gl.FRAGMENT_SHADER);
 
             gl.attachShader(shaderProgram, vs);
             gl.attachShader(shaderProgram, fs);
             gl.linkProgram(shaderProgram);
 
             if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error("Shader program failed to link");
                 gl.deleteProgram(shaderProgram);
                 gl.deleteShader(vs);
                 gl.deleteShader(fs);
                 return null;
             }
 
-            var i, attrib, uniform;
-            var attribCount = gl.getProgramParameter(shaderProgram, gl.ACTIVE_ATTRIBUTES);
-            shaderProgram.attribute = {};
-            for (i = 0; i < attribCount; i++) {
-                attrib = gl.getActiveAttrib(shaderProgram, i);
-                shaderProgram.attribute[attrib.name] = gl.getAttribLocation(shaderProgram, attrib.name);
-            }
-
-            var uniformCount = gl.getProgramParameter(shaderProgram, gl.ACTIVE_UNIFORMS);
-            shaderProgram.uniform = {};
-            for (i = 0; i < uniformCount; i++) {
-                uniform = gl.getActiveUniform(shaderProgram, i);
-                shaderProgram.uniform[uniform.name] = gl.getUniformLocation(shaderProgram, uniform.name);
-            }
-
-            return shaderProgram;
+            return new ShaderWrapper(gl, shaderProgram);
         },
 
-        _compileShader: function(gl, source, type) {
-            var shaderHeader = "#ifdef GL_ES\n";
-            shaderHeader += "precision highp float;\n";
-            shaderHeader += "#endif\n";
+        compileShader: function(gl, source, type) {
+            var shaderHeader = "\n";
 
             var shader = gl.createShader(type);
 
@@ -115,75 +194,28 @@ define(function() {
             gl.compileShader(shader);
 
             if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-                console.debug(gl.getShaderInfoLog(shader));
+                var typeString = "";
+                switch(type) {
+                    case gl.VERTEX_SHADER: typeString = "VERTEX_SHADER"; break;
+                    case gl.FRAGMENT_SHADER: typeString = "FRAGMENT_SHADER"; break;
+                }
+                console.error(typeString, gl.getShaderInfoLog(shader));
                 gl.deleteShader(shader);
                 return null;
             }
 
             return shader;
         },
-    
-        createSolidTexture: function(gl, color) {
-            var data = new Uint8Array(color);
-            var texture = gl.createTexture();
-            gl.bindTexture(gl.TEXTURE_2D, texture);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, data);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-            return texture;
-        },
-    
-        loadTexture: function(gl, src, callback) {
-            var texture = gl.createTexture();
-            var image = new Image();
-            image.addEventListener("load", function() {
-                gl.bindTexture(gl.TEXTURE_2D, texture);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
-                gl.generateMipmap(gl.TEXTURE_2D);
-            
-                if(callback) { callback(texture); }
-            });
-            image.src = src;
-            return texture;
-        },
-    
-        startRenderLoop: function(gl, canvas, callback) {
-            var startTime = window.webkitAnimationStartTime || 
-                window.mozAnimationStartTime ||
-                new Date().getTime();
 
-            var lastTimeStamp = startTime;
-            var lastFpsTimeStamp = startTime;
-            var framesPerSecond = 0;
-            var frameCount = 0;
-        
-            function nextFrame(time){
-                // Recommendation from Opera devs: calling the RAF shim at the beginning of your
-                // render loop improves framerate on browsers that fall back to setTimeout
-                window.requestAnimationFrame(nextFrame, canvas);
-                
-                // Update FPS if a second or more has passed since last FPS update
-                if(time - lastFpsTimeStamp >= 1000) {
-                    framesPerSecond = frameCount;
-                    frameCount = 0;
-                    lastFpsTimeStamp = time;
-                } 
-
-                callback(gl, {
-                    startTime: startTime,
-                    timeStamp: time,
-                    elapsed: time - startTime,
-                    frameTime: time - lastTimeStamp,
-                    framesPerSecond: framesPerSecond,
-                });
-            
-                ++frameCount;
-                lastTimeStamp = time;
-            };
-
-            window.requestAnimationFrame(nextFrame, canvas);
-        },
+        getExtension: function(gl, name) {
+            var i, ext;
+            for(i in vendorPrefixes) {
+                ext = gl.getExtension(vendorPrefixes[i] + name);
+                if (ext) {
+                    return ext;
+                }
+            }
+            return null;
+        }
     };
 });
